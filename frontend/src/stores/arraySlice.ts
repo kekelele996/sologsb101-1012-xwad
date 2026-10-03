@@ -60,15 +60,18 @@ export const updateArray = createAsyncThunk(
   }
 );
 
-/** 删除台阵：级联删除台站、仪器、标定与更换记录 */
+/** 删除台阵：级联删除台站、仪器、标定、停测时段与更换记录 */
 export const removeArray = createAsyncThunk('array/removeArray', async (arrayId: string) => {
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.suspensions],
     async () => {
-      const stationIds = (await db.stations.where('arrayId').equals(arrayId).toArray()).map(
-        (row) => row.id
-      );
+      const stations = await db.stations.where('arrayId').equals(arrayId).toArray();
+      const stationIds = stations.map((row) => row.id);
+      const codes = stations.map((row) => row.code);
+      if (codes.length > 0) {
+        await db.suspensions.where('stationCode').anyOf(codes).delete();
+      }
       if (stationIds.length > 0) {
         const instrumentIds = (
           await db.instruments.where('stationId').anyOf(stationIds).toArray()
@@ -104,19 +107,25 @@ export const updateStation = createAsyncThunk(
   }
 );
 
-/** 删除台站：级联删除仪器、标定与更换记录 */
+/** 删除台站：级联删除仪器、标定、停测时段与更换记录 */
 export const removeStation = createAsyncThunk('array/removeStation', async (stationId: string) => {
-  await db.transaction('rw', [db.stations, db.instruments, db.calibrations, db.replaces], async () => {
-    const instrumentIds = (
-      await db.instruments.where('stationId').equals(stationId).toArray()
-    ).map((row) => row.id);
-    if (instrumentIds.length > 0) {
-      await db.calibrations.where('instrumentId').anyOf(instrumentIds).delete();
-      await db.replaces.where('instrumentId').anyOf(instrumentIds).delete();
-      await db.instruments.bulkDelete(instrumentIds);
+  await db.transaction(
+    'rw',
+    [db.stations, db.instruments, db.calibrations, db.replaces, db.suspensions],
+    async () => {
+      const station = await db.stations.get(stationId);
+      if (station) await db.suspensions.where('stationCode').equals(station.code).delete();
+      const instrumentIds = (
+        await db.instruments.where('stationId').equals(stationId).toArray()
+      ).map((row) => row.id);
+      if (instrumentIds.length > 0) {
+        await db.calibrations.where('instrumentId').anyOf(instrumentIds).delete();
+        await db.replaces.where('instrumentId').anyOf(instrumentIds).delete();
+        await db.instruments.bulkDelete(instrumentIds);
+      }
+      await db.stations.delete(stationId);
     }
-    await db.stations.delete(stationId);
-  });
+  );
   return stationId;
 });
 

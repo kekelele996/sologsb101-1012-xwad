@@ -12,9 +12,10 @@ import type { Instrument } from '@/types/instrument';
 import { judgeCalibration } from '@/types/calibration';
 import type { Calibration } from '@/types/calibration';
 import type { Replace } from '@/types/replace';
+import type { SuspensionWindow } from '@/types/suspension';
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbseisarray';
@@ -24,7 +25,18 @@ export const LS_KEYS = {
   dbVersion: 'gbseisarray:db-version',
   lastBackupAt: 'gbseisarray:last-backup-at',
   lastArrayId: 'gbseisarray:last-array-id',
+  /** v3 升级时补不出停测时段的台站清单（单列） */
+  unresolvedSuspensions: 'gbseisarray:unresolved-suspensions',
 } as const;
+
+/** 升级迁移中无法补出停测时段的台站（旧数据只有停测状态、无标定日期） */
+export interface UnresolvedSuspension {
+  stationId: string;
+  stationCode: string;
+  arrayId: string;
+  reason: string;
+  detectedAt: number;
+}
 
 /** 备份文件结构，供 utils/export.ts 与几何页使用 */
 export interface BackupPayload {
@@ -36,6 +48,7 @@ export interface BackupPayload {
   instruments: Instrument[];
   calibrations: Calibration[];
   replaces: Replace[];
+  suspensions: SuspensionWindow[];
 }
 
 export class SeisArrayDatabase extends Dexie {
@@ -44,6 +57,8 @@ export class SeisArrayDatabase extends Dexie {
   instruments!: Table<Instrument, string>;
   calibrations!: Table<Calibration, string>;
   replaces!: Table<Replace, string>;
+  /** 台网中心侧：停测时段台账（按台站码挂账） */
+  suspensions!: Table<SuspensionWindow, string>;
 
   constructor() {
     super(DB_NAME);
@@ -58,16 +73,26 @@ export class SeisArrayDatabase extends Dexie {
     });
 
     // v2：补齐筛选与统计需要的索引（孔径/布设日期、经纬度/基岩、类型/序列号、灵敏度/结论、原因）
+    this.version(2).stores({
+      arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
+      stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
+      instruments: 'id, stationId, type, model, serialNo, installDate, state, updatedAt',
+      calibrations: 'id, instrumentId, date, sensitivity, selfNoise, responseVerdict, updatedAt',
+      replaces: 'id, instrumentId, state, date, newSerialNo, updatedAt',
+    });
+
+    // v3：两侧分账 —— 台网中心新增停测时段表，台站加观测状态，标定记录加对账认账时间
     this.version(DB_VERSION)
       .stores({
         arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
-        stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
+        stations: 'id, arrayId, code, lat, lng, elevM, bedrock, obsStatus, updatedAt',
         instruments: 'id, stationId, type, model, serialNo, installDate, state, updatedAt',
-        calibrations: 'id, instrumentId, date, sensitivity, selfNoise, responseVerdict, updatedAt',
+        calibrations: 'id, instrumentId, date, sensitivity, selfNoise, responseVerdict, acknowledgedAt, updatedAt',
         replaces: 'id, instrumentId, state, date, newSerialNo, updatedAt',
+        suspensions: 'id, stationCode, startDate, endDate, updatedAt',
       })
       .upgrade(async (tx) => {
-        // 迁移：历史数据补齐时间戳与必填字段，避免列表排序与筛选拿到 undefined
+        // 兼容 v1 直升 v3：历史数据补齐时间戳与必填字段（v2 迁移逻辑保留）
         const defaults: Array<[string, () => Record<string, unknown>]> = [
           ['arrays', () => ({ apertureKm: 0, stationCount: 0, department: '' })],
           ['stations', () => ({ lat: 0, lng: 0, elevM: 0, bedrock: '花岗岩', siteNote: '' })],
@@ -86,6 +111,81 @@ export class SeisArrayDatabase extends Dexie {
               Object.assign(row, factory());
             });
         }
+
+        // v2 → v3：历史标定补认账字段
+        await tx
+          .table('calibrations')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (row.acknowledgedAt === undefined) row.acknowledgedAt = null;
+          });
+
+        // 台站补观测状态；旧数据只有"停测"这一个状态线索，按最近一次标定日期补停测时段：
+        //  - 有标定日期：从最近标定次日起停测、未复测（endDate 留空），等中心登记复测日；
+        //  - 补不出来（台站下查不到任何标定）：单列到 unresolved 清单，计量站先挂起不算超期。
+        const instruments = await tx.table<Instrument, string>('instruments').toArray();
+        const calibrations = await tx.table<Calibration, string>('calibrations').toArray();
+        const unresolved: UnresolvedSuspension[] = [];
+        const inferredWindows: SuspensionWindow[] = [];
+        const now = Date.now();
+
+        const latestCalibDateByStation = new Map<string, string>();
+        instruments.forEach((instrument) => {
+          calibrations
+            .filter((row) => row.instrumentId === instrument.id)
+            .forEach((row) => {
+              const prev = latestCalibDateByStation.get(instrument.stationId);
+              if (!prev || row.date.localeCompare(prev) > 0) {
+                latestCalibDateByStation.set(instrument.stationId, row.date);
+              }
+            });
+        });
+
+        // 注意：toArray() 返回快照，必须经 modify / bulkPut 才能落库
+        await tx
+          .table<SeisStation, string>('stations')
+          .toCollection()
+          .modify((station) => {
+            const legacySuspended =
+              (station as unknown as { suspended?: boolean }).suspended === true ||
+              station.obsStatus === '停测';
+            if (!legacySuspended) {
+              if (!station.obsStatus) station.obsStatus = '运行';
+              return;
+            }
+            station.obsStatus = '停测';
+            const latestDate = latestCalibDateByStation.get(station.id);
+            if (!latestDate) {
+              unresolved.push({
+                stationId: station.id,
+                stationCode: station.code,
+                arrayId: station.arrayId,
+                reason: '旧数据仅有停测状态，且查不到任何标定日期，无法补推停测起始日',
+                detectedAt: now,
+              });
+              return;
+            }
+            const start = new Date(Date.parse(`${latestDate}T00:00:00`) + 86400000)
+              .toISOString()
+              .slice(0, 10);
+            inferredWindows.push({
+              id: `sus_upg_${station.id}`,
+              stationCode: station.code,
+              startDate: start,
+              endDate: '',
+              reason: '旧数据升级补推（按最近一次标定日期）',
+              operator: '系统迁移',
+              remark: '请台网中心核对并补登记复测日期',
+              inferred: true,
+              createdAt: now,
+              updatedAt: now,
+            });
+          });
+
+        if (inferredWindows.length > 0) {
+          await tx.table<SuspensionWindow, string>('suspensions').bulkPut(inferredWindows);
+        }
+        writeUnresolvedSuspensions(unresolved);
       });
   }
 }
@@ -147,6 +247,7 @@ interface SeedStation {
   lng: number;
   elevM: number;
   bedrock: SeisStation['bedrock'];
+  obsStatus: SeisStation['obsStatus'];
   siteNote: string;
   instruments: SeedInstrument[];
 }
@@ -187,6 +288,7 @@ export async function seedDemoData(): Promise<void> {
           lng: 103.5624,
           elevM: 1180,
           bedrock: '花岗岩',
+          obsStatus: '运行',
           siteNote: '基岩出露，噪声本底低',
           instruments: [
             {
@@ -253,7 +355,8 @@ export async function seedDemoData(): Promise<void> {
           lng: 103.6412,
           elevM: 1425,
           bedrock: '玄武岩',
-          siteNote: '半山台基，交通便利',
+          obsStatus: '停测',
+          siteNote: '半山台基，交通便利；扩建施工停测，复测待安排',
           instruments: [
             {
               id: 'ins_ltx02_bb',
@@ -309,7 +412,8 @@ export async function seedDemoData(): Promise<void> {
           lng: 103.4987,
           elevM: 986,
           bedrock: '石灰岩',
-          siteNote: '河谷阶地，需注意汛期供电',
+          obsStatus: '运行',
+          siteNote: '河谷阶地，需注意汛期供电；2025 年台址改造停测后已复测',
           instruments: [
             {
               id: 'ins_ltx03_bb',
@@ -353,7 +457,8 @@ export async function seedDemoData(): Promise<void> {
           lng: 119.3421,
           elevM: 62,
           bedrock: '花岗岩',
-          siteNote: '海岛台，防盐雾处理',
+          obsStatus: '停测',
+          siteNote: '海岛台，防盐雾处理；码头改造停测中',
           instruments: [
             {
               id: 'ins_hx01_bb',
@@ -419,7 +524,8 @@ export async function seedDemoData(): Promise<void> {
           lng: 119.5112,
           elevM: 128,
           bedrock: '砂岩',
-          siteNote: '覆盖层较厚，需做场地响应校正',
+          obsStatus: '停测',
+          siteNote: '覆盖层较厚，需做场地响应校正；中心标记停测，时段待登记',
           instruments: [
             {
               id: 'ins_hx02_bb',
@@ -488,9 +594,52 @@ export async function seedDemoData(): Promise<void> {
     },
   ];
 
+  /**
+   * 停测时段（台网中心账），覆盖三种典型场景：
+   * - LTX03：已复测的停测，扣减后 2026-09-18 到期（播种时已超期），照旧排标定；
+   * - LTX02：施工停测中（未复测），扣减后够不到期，不进更换提醒；
+   * - HX01：海岛码头改造停测中，周期顺延，不进更换提醒；
+   * - HX02：台站标了停测但中心没登记时段（故意不建窗口），计量站先挂起不算超期。
+   */
+  const suspensionWindows: SuspensionWindow[] = [
+    {
+      id: 'sus_ltx03_1',
+      stationCode: 'LTX03',
+      startDate: daysAgo(675),
+      endDate: daysAgo(440),
+      reason: '台址基建改造，仪器停测',
+      operator: '郑安平',
+      remark: '改造完成后复测合格，恢复运行',
+      createdAt: now - 630 * 86400000,
+      updatedAt: now - 440 * 86400000,
+    },
+    {
+      id: 'sus_ltx02_1',
+      stationCode: 'LTX02',
+      startDate: daysAgo(210),
+      endDate: '',
+      reason: '观测楼扩建施工，停测复测',
+      operator: '郑安平',
+      remark: '施工窗口期未定，复测日期待补',
+      createdAt: now - 210 * 86400000,
+      updatedAt: now - 210 * 86400000,
+    },
+    {
+      id: 'sus_hx01_1',
+      stationCode: 'HX01',
+      startDate: daysAgo(400),
+      endDate: '',
+      reason: '码头改造，供电与通信中断',
+      operator: '陈海生',
+      remark: '改造完工后统一复测',
+      createdAt: now - 400 * 86400000,
+      updatedAt: now - 400 * 86400000,
+    },
+  ];
+
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.suspensions],
     async () => {
       const stamp = (offset: number): { createdAt: number; updatedAt: number } => ({
         createdAt: now + offset,
@@ -523,6 +672,7 @@ export async function seedDemoData(): Promise<void> {
               calibrationRows.push({
                 ...calibrationSeed,
                 responseVerdict: verdict,
+                acknowledgedAt: null,
                 ...stamp(
                   400 + arrayIndex * 400 + stationIndex * 100 + instrumentIndex * 20 + calibrationIndex
                 ),
@@ -537,6 +687,7 @@ export async function seedDemoData(): Promise<void> {
       await db.instruments.bulkPut(instrumentRows);
       await db.calibrations.bulkPut(calibrationRows);
       await db.replaces.bulkPut(replaces);
+      await db.suspensions.bulkPut(suspensionWindows);
     }
   );
 }
@@ -555,7 +706,7 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.suspensions],
     async () => {
       await Promise.all([
         db.arrays.clear(),
@@ -563,9 +714,11 @@ export async function clearAllTables(): Promise<void> {
         db.instruments.clear(),
         db.calibrations.clear(),
         db.replaces.clear(),
+        db.suspensions.clear(),
       ]);
     }
   );
+  writeUnresolvedSuspensions([]);
 }
 
 /** 清空并重新播种演示数据 */
@@ -576,14 +729,43 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与几何页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
+  const [arrays, stations, instruments, calibrations, replaces, suspensions] = await Promise.all([
     db.arrays.count(),
     db.stations.count(),
     db.instruments.count(),
     db.calibrations.count(),
     db.replaces.count(),
+    db.suspensions.count(),
   ]);
-  return { arrays, stations, instruments, calibrations, replaces };
+  return { arrays, stations, instruments, calibrations, replaces, suspensions };
+}
+
+/* --------------------- 旧数据升级：补不出停测时段的台站清单（单列） --------------------- */
+
+export function readUnresolvedSuspensions(): UnresolvedSuspension[] {
+  try {
+    const raw = localStorage.getItem(LS_KEYS.unresolvedSuspensions);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as UnresolvedSuspension[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function writeUnresolvedSuspensions(list: UnresolvedSuspension[]): void {
+  try {
+    if (list.length === 0) localStorage.removeItem(LS_KEYS.unresolvedSuspensions);
+    else localStorage.setItem(LS_KEYS.unresolvedSuspensions, JSON.stringify(list));
+  } catch {
+    // 隐私模式下 localStorage 不可用，忽略
+  }
+}
+
+/** 中心补登记停测时段后，把该台站移出未决清单 */
+export function resolveUnresolvedSuspension(stationId: string): void {
+  const remaining = readUnresolvedSuspensions().filter((item) => item.stationId !== stationId);
+  writeUnresolvedSuspensions(remaining);
 }
 
 /** 写入结构版本号到 localStorage，便于几何页比对 */

@@ -28,6 +28,7 @@ import { useAppSelector } from '@/stores/store';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
 import { selectInstruments } from '@/stores/instrumentSlice';
 import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
+import { selectSuspensions } from '@/stores/suspensionSlice';
 import {
   DB_NAME,
   DB_VERSION,
@@ -52,7 +53,14 @@ import {
 } from '@/utils/export';
 import { bearingDeg, round, stationDistances, toLocalPlane, planeViewBox } from '@/utils/geo';
 
-const EMPTY_COUNTS: CountMap = { arrays: 0, stations: 0, instruments: 0, calibrations: 0, replaces: 0 };
+const EMPTY_COUNTS: CountMap = {
+  arrays: 0,
+  stations: 0,
+  instruments: 0,
+  calibrations: 0,
+  replaces: 0,
+  suspensions: 0,
+};
 
 export default function GeometryView() {
   const { message } = AntdApp.useApp();
@@ -62,6 +70,7 @@ export default function GeometryView() {
   const instruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const suspensions = useAppSelector(selectSuspensions);
 
   const [selectedArrayId, setSelectedArrayId] = useState<string | null>(null);
   const [counts, setCounts] = useState<CountMap>(EMPTY_COUNTS);
@@ -86,7 +95,7 @@ export default function GeometryView() {
   useEffect(() => {
     void refresh();
     // 数据变化后刷新统计
-  }, [arrays, stations, instruments, calibrations, replaces]);
+  }, [arrays, stations, instruments, calibrations, replaces, suspensions]);
 
   const activeArrayId = selectedArrayId ?? arrays[0]?.id ?? null;
   const activeArray = arrays.find((row) => row.id === activeArrayId) ?? null;
@@ -106,9 +115,10 @@ export default function GeometryView() {
       instruments,
       calibrations,
       replaces,
+      suspensions,
     };
     return buildArraySummaries(payload);
-  }, [arrays, calibrations, instruments, replaces, stations]);
+  }, [arrays, calibrations, instruments, replaces, stations, suspensions]);
 
   const activeSummary = summaries.find((row) => row.arrayId === activeArrayId) ?? null;
 
@@ -284,6 +294,7 @@ export default function GeometryView() {
         <StatBadge label="仪器" value={counts.instruments} suffix="台" tone="default" />
         <StatBadge label="标定记录" value={counts.calibrations} suffix="次" tone="success" />
         <StatBadge label="更换记录" value={counts.replaces} suffix="条" tone="warning" />
+        <StatBadge label="停测时段" value={counts.suspensions} suffix="段" tone="warning" />
       </div>
 
       {!activeArray || !activeSummary ? (
@@ -511,7 +522,8 @@ export default function GeometryView() {
           </Descriptions>
           <p className="gb-hint">
             数据仅保存在当前浏览器 IndexedDB（{DB_NAME}）中，换浏览器或清空站点数据后不会自动跟随，请通过 JSON
-            备份迁移。导出内容包含 arrays / stations / instruments / calibrations / replaces 五张表。
+            备份迁移。导出内容包含 arrays / stations / instruments / calibrations / replaces /
+            suspensions 六张表。
           </p>
         </Space>
       </Card>

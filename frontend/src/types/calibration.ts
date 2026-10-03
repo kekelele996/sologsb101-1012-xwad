@@ -20,6 +20,11 @@ export interface Calibration {
   operator: string;
   /** 标定机构 */
   agency: string;
+  /**
+   * 对账认账时间（台网中心按台站码对平后写入）。
+   * 有值表示中心已认过该结论；之后即使对账重试，计量站侧结论也不回退。
+   */
+  acknowledgedAt: number | null;
   /** 备注 */
   remark: string;
   createdAt: number;

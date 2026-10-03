@@ -346,8 +346,9 @@ export default function CalibrationBoard() {
             标定记录台
           </Typography.Title>
           <p className="gb-hint">
-            录入灵敏度、自噪与脉冲响应结论，系统按类型灵敏度区间（宽频带 {SENSITIVITY_RANGE.宽频带.min} ~{' '}
-            {SENSITIVITY_RANGE.宽频带.max}）与自噪限值（{SELF_NOISE_LIMIT}）自动初判；可勾选批量改结论。
+            计量站侧只管标定记录、灵敏度与脉冲响应结论：系统按类型灵敏度区间（宽频带{' '}
+            {SENSITIVITY_RANGE.宽频带.min} ~ {SENSITIVITY_RANGE.宽频带.max}）与自噪限值（
+            {SELF_NOISE_LIMIT}）自动初判。停测起止由台网中心登记并按台站码对账认账，认过的结论重试不回退。
           </p>
         </div>
         <Space wrap>
@@ -481,12 +482,25 @@ export default function CalibrationBoard() {
               title: '响应结论',
               width: 190,
               render: (_: unknown, item: CalibrationRow) => (
-                <QualifyTag
-                  verdict={item.row.responseVerdict}
-                  sensitivity={item.row.sensitivity}
-                  selfNoise={item.row.selfNoise}
-                  size="small"
-                />
+                <div>
+                  <QualifyTag
+                    verdict={item.row.responseVerdict}
+                    sensitivity={item.row.sensitivity}
+                    selfNoise={item.row.selfNoise}
+                    size="small"
+                  />
+                  {typeof item.row.acknowledgedAt === 'number' ? (
+                    <div className="gb-hint">
+                      <Tag color="blue" style={{ marginInlineStart: 0, marginTop: 2 }}>
+                        中心已认账
+                      </Tag>
+                    </div>
+                  ) : (
+                    <div className="gb-hint" style={{ marginTop: 2 }}>
+                      待中心对账认账
+                    </div>
+                  )}
+                </div>
               ),
             },
             {

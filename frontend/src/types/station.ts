@@ -3,6 +3,14 @@ export type BedrockType = '花岗岩' | '玄武岩' | '石灰岩' | '砂岩' | '
 
 export const BEDROCK_TYPES: BedrockType[] = ['花岗岩', '玄武岩', '石灰岩', '砂岩', '片麻岩', '第四系覆盖'];
 
+/**
+ * 台站观测状态（台网中心维护）：
+ * 施工停测期间标「停测」，复测后恢复「运行」；停测起止时段另挂在停测台账上。
+ */
+export type StationObsState = '运行' | '停测';
+
+export const STATION_OBS_STATES: StationObsState[] = ['运行', '停测'];
+
 /** 台站：台阵内的观测点位 */
 export interface SeisStation {
   id: string;
@@ -18,6 +26,8 @@ export interface SeisStation {
   elevM: number;
   /** 基岩类型 */
   bedrock: BedrockType;
+  /** 观测状态：运行 / 停测（旧数据缺省按运行） */
+  obsStatus: StationObsState;
   /** 场地备注 */
   siteNote: string;
   createdAt: number;

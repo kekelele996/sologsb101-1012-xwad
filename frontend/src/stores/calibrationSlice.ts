@@ -43,7 +43,12 @@ const initialState: CalibrationSliceState = {
 
 export const createCalibration = createAsyncThunk(
   'calibration/createCalibration',
-  async (payload: Omit<Calibration, 'id' | 'createdAt' | 'updatedAt' | 'responseVerdict'>) => {
+  async (
+    payload: Omit<
+      Calibration,
+      'id' | 'createdAt' | 'updatedAt' | 'responseVerdict' | 'acknowledgedAt'
+    >
+  ) => {
     const now = Date.now();
     const instrument = await db.instruments.get(payload.instrumentId);
     const verdict = judgeCalibration(
@@ -54,6 +59,8 @@ export const createCalibration = createAsyncThunk(
     const row: Calibration = {
       ...payload,
       responseVerdict: verdict,
+      // 新标定默认未对账认账，待台网中心按台站码对平后写入
+      acknowledgedAt: null,
       id: createId('cal'),
       createdAt: now,
       updatedAt: now,

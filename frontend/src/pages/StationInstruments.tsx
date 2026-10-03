@@ -59,17 +59,27 @@ import {
   updateInstrument,
 } from '@/stores/instrumentSlice';
 import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
-import { BEDROCK_TYPES, validateLatLng, type BedrockType, type SeisStation } from '@/types/station';
+import { selectWindowsByStationCode } from '@/stores/suspensionSlice';
+import {
+  BEDROCK_TYPES,
+  STATION_OBS_STATES,
+  validateLatLng,
+  type BedrockType,
+  type SeisStation,
+  type StationObsState,
+} from '@/types/station';
 import {
   COMMON_MODELS,
   INSTRUMENT_STATES,
   INSTRUMENT_TYPES,
+  CALIBRATION_CYCLE_DAYS,
   createEmptyInstrumentDraft,
   daysUntilDue,
   type Instrument,
   type InstrumentState,
   type InstrumentType,
 } from '@/types/instrument';
+import { evaluateDue, dueStateText } from '@/types/suspension';
 import { formatLatLng, round } from '@/utils/geo';
 import { initDatabase } from '@/utils/db';
 
@@ -79,6 +89,7 @@ interface StationFormValues {
   lng: number;
   elevM: number;
   bedrock: BedrockType;
+  obsStatus: StationObsState;
   siteNote: string;
 }
 
@@ -115,6 +126,7 @@ export default function StationInstruments() {
   const allInstruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const windowsByCode = useAppSelector(selectWindowsByStationCode);
 
   const [stationModalOpen, setStationModalOpen] = useState(false);
   const [editingStationId, setEditingStationId] = useState<string | null>(null);
@@ -169,7 +181,14 @@ export default function StationInstruments() {
               .filter((calibration) => calibration.instrumentId === instrument.id)
               .sort((a, b) => b.date.localeCompare(a.date));
             const last = own.length > 0 ? own[0].date : instrument.installDate;
-            return daysUntilDue(last, instrument.installDate) < 0;
+            const due = evaluateDue({
+              baseDate: last,
+              cycleDays: CALIBRATION_CYCLE_DAYS,
+              windows: windowsByCode[station.code] ?? [],
+              stationState: station.obsStatus,
+            });
+            // 停测挂起 / 停测中未到期不计超期
+            return due.state === 'overdue';
           }).length;
           return {
             station,
@@ -180,7 +199,7 @@ export default function StationInstruments() {
             worstVerdict: unqualified > 0 ? '不合格' : stationCalibrations.length > 0 ? '合格' : '待判定',
           };
         }),
-    [allInstruments, calibrations, stationFilter, stations]
+    [allInstruments, calibrations, stationFilter, stations, windowsByCode]
   );
 
   const totals = useMemo(
@@ -208,6 +227,7 @@ export default function StationInstruments() {
       lng: 103.5,
       elevM: 1000,
       bedrock: '花岗岩',
+      obsStatus: '运行',
       siteNote: '',
     });
     setStationModalOpen(true);
@@ -221,6 +241,7 @@ export default function StationInstruments() {
       lng: station.lng,
       elevM: station.elevM,
       bedrock: station.bedrock,
+      obsStatus: station.obsStatus ?? '运行',
       siteNote: station.siteNote,
     });
     setStationModalOpen(true);
@@ -249,6 +270,7 @@ export default function StationInstruments() {
         lng: Number(values.lng),
         elevM: Number(values.elevM),
         bedrock: values.bedrock,
+        obsStatus: values.obsStatus ?? '运行',
         siteNote: values.siteNote?.trim() ?? '',
       };
       if (editingStationId) {
@@ -495,6 +517,25 @@ export default function StationInstruments() {
               render: (_: unknown, row: StationRow) => <Tag>{row.station.bedrock}</Tag>,
             },
             {
+              title: '观测状态',
+              width: 130,
+              render: (_: unknown, row: StationRow) => {
+                const suspended = row.station.obsStatus === '停测';
+                const hasWindow = (windowsByCode[row.station.code] ?? []).length > 0;
+                if (!suspended) return <Tag color="green">运行</Tag>;
+                return (
+                  <div>
+                    <Tag color="orange">停测</Tag>
+                    {hasWindow ? (
+                      <div className="gb-hint">时段已登记</div>
+                    ) : (
+                      <div className="gb-danger gb-hint">时段待登记</div>
+                    )}
+                  </div>
+                );
+              },
+            },
+            {
               title: '仪器台数',
               width: 110,
               align: 'center',
@@ -637,16 +678,27 @@ export default function StationInstruments() {
                 },
                 {
                   title: '距下次标定',
-                  width: 130,
+                  width: 150,
                   render: (_: unknown, instrument: Instrument) => {
                     const own = calibrations
                       .filter((row) => row.instrumentId === instrument.id)
                       .sort((a, b) => b.date.localeCompare(a.date));
                     const last = own.length > 0 ? own[0].date : instrument.installDate;
-                    const days = daysUntilDue(last, instrument.installDate);
+                    const due = evaluateDue({
+                      baseDate: last,
+                      cycleDays: CALIBRATION_CYCLE_DAYS,
+                      windows: activeStation ? windowsByCode[activeStation.code] ?? [] : [],
+                      stationState: activeStation?.obsStatus ?? '运行',
+                    });
+                    if (due.state === 'pending-period') {
+                      return <Tag color="default">停测时段待登记</Tag>;
+                    }
+                    if (due.state === 'suspended-ok') {
+                      return <Tag color="gold">停测顺延 {due.deductedDays} 天</Tag>;
+                    }
                     return (
-                      <span className={days < 0 ? 'gb-danger gb-mono' : 'gb-mono'}>
-                        {days < 0 ? `超期 ${Math.abs(days)} 天` : `剩余 ${days} 天`}
+                      <span className={due.state === 'overdue' ? 'gb-danger gb-mono' : 'gb-mono'}>
+                        {dueStateText(due)}
                       </span>
                     );
                   },
@@ -731,6 +783,13 @@ export default function StationInstruments() {
             <Col span={12}>
               <Form.Item name="bedrock" label="基岩类型" rules={[{ required: true }]}>
                 <Select options={BEDROCK_TYPES.map((bedrock) => ({ label: bedrock, value: bedrock }))} />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item name="obsStatus" label="观测状态（台网中心）" rules={[{ required: true }]}>
+                <Select
+                  options={STATION_OBS_STATES.map((state) => ({ label: state, value: state }))}
+                />
               </Form.Item>
             </Col>
           </Row>

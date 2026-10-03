@@ -131,3 +131,13 @@ body::before {
     padding: 12px;
   }
 }
+
+/* 更换提醒：超期行红底；停测挂起 / 停测中未到期行灰底（不进提醒） */
+.gb-table-compact .gb-row-danger > .ant-table-cell {
+  background: #fdecea !important;
+}
+
+.gb-table-compact .gb-row-held > .ant-table-cell {
+  background: #f4f6f8 !important;
+  color: #8194a2;
+}
