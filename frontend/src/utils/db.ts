@@ -12,9 +12,12 @@ import type { Instrument } from '@/types/instrument';
 import { judgeCalibration } from '@/types/calibration';
 import type { Calibration } from '@/types/calibration';
 import type { Replace } from '@/types/replace';
+import type { Suspension } from '@/types/suspension';
+import type { Reconciliation } from '@/types/reconciliation';
+import { backfillSuspensions } from '@/utils/reconcile';
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbseisarray';
@@ -24,6 +27,8 @@ export const LS_KEYS = {
   dbVersion: 'gbseisarray:db-version',
   lastBackupAt: 'gbseisarray:last-backup-at',
   lastArrayId: 'gbseisarray:last-array-id',
+  /** v3 升级时补不出停测时段、需单列人工处理的台站码（JSON 数组） */
+  unresolvedSuspensions: 'gbseisarray:unresolved-suspensions',
 } as const;
 
 /** 备份文件结构，供 utils/export.ts 与几何页使用 */
@@ -36,6 +41,8 @@ export interface BackupPayload {
   instruments: Instrument[];
   calibrations: Calibration[];
   replaces: Replace[];
+  suspensions: Suspension[];
+  reconciliations: Reconciliation[];
 }
 
 export class SeisArrayDatabase extends Dexie {
@@ -44,6 +51,10 @@ export class SeisArrayDatabase extends Dexie {
   instruments!: Table<Instrument, string>;
   calibrations!: Table<Calibration, string>;
   replaces!: Table<Replace, string>;
+  /** 台网中心：停测时段 */
+  suspensions!: Table<Suspension, string>;
+  /** 台站码对账台账 */
+  reconciliations!: Table<Reconciliation, string>;
 
   constructor() {
     super(DB_NAME);
@@ -58,19 +69,33 @@ export class SeisArrayDatabase extends Dexie {
     });
 
     // v2：补齐筛选与统计需要的索引（孔径/布设日期、经纬度/基岩、类型/序列号、灵敏度/结论、原因）
+    this.version(2).stores({
+      arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
+      stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
+      instruments: 'id, stationId, type, model, serialNo, installDate, state, updatedAt',
+      calibrations: 'id, instrumentId, date, sensitivity, selfNoise, responseVerdict, updatedAt',
+      replaces: 'id, instrumentId, state, date, newSerialNo, updatedAt',
+    });
+
+    // v3：台网中心 / 计量站分治。
+    // - 台站新增运行状态 runState（运行/停测，台网中心管）；
+    // - 新增 suspensions（停测时段，台网中心管）与 reconciliations（台站码对账台账）；
+    // - 旧数据只有停测状态的，按最近一次标定日期补停测时段，补不出的单列。
     this.version(DB_VERSION)
       .stores({
         arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
-        stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
+        stations: 'id, arrayId, code, lat, lng, elevM, bedrock, runState, updatedAt',
         instruments: 'id, stationId, type, model, serialNo, installDate, state, updatedAt',
-        calibrations: 'id, instrumentId, date, sensitivity, selfNoise, responseVerdict, updatedAt',
+        calibrations: 'id, instrumentId, date, sensitivity, selfNoise, responseVerdict, agency, updatedAt',
         replaces: 'id, instrumentId, state, date, newSerialNo, updatedAt',
+        suspensions: 'id, stationCode, suspendDate, resumeDate, updatedAt',
+        reconciliations: 'id, stationCode, status, reconciledAt, updatedAt',
       })
       .upgrade(async (tx) => {
         // 迁移：历史数据补齐时间戳与必填字段，避免列表排序与筛选拿到 undefined
         const defaults: Array<[string, () => Record<string, unknown>]> = [
           ['arrays', () => ({ apertureKm: 0, stationCount: 0, department: '' })],
-          ['stations', () => ({ lat: 0, lng: 0, elevM: 0, bedrock: '花岗岩', siteNote: '' })],
+          ['stations', () => ({ lat: 0, lng: 0, elevM: 0, bedrock: '花岗岩', runState: '运行', siteNote: '' })],
           ['instruments', () => ({ type: '宽频带', model: '', state: '在用', remark: '' })],
           ['calibrations', () => ({ sensitivity: 0, selfNoise: 0, responseVerdict: '待判定', agency: '' })],
           ['replaces', () => ({ state: '待更换', newSerialNo: '', operator: '' })],
@@ -85,6 +110,39 @@ export class SeisArrayDatabase extends Dexie {
               if (typeof row.updatedAt !== 'number') row.updatedAt = row.createdAt;
               Object.assign(row, factory());
             });
+        }
+
+        // 旧数据：台阵级「停测」沿用为其下台站的停测状态（runState 默认运行）。
+        const arraysTable = tx.table<SeisArray, string>('arrays');
+        const stationsTable = tx.table<SeisStation, string>('stations');
+        const suspendedArrayIds = new Set(
+          (await arraysTable.toArray()).filter((array) => array.state === '停测').map((array) => array.id)
+        );
+        if (suspendedArrayIds.size > 0) {
+          await stationsTable.toCollection().modify((station: SeisStation) => {
+            if (suspendedArrayIds.has(station.arrayId)) station.runState = '停测';
+          });
+        }
+
+        // 旧数据只有停测状态：按最近一次标定日期补停测时段，补不出的单列。
+        const [stations, instruments, calibrations] = await Promise.all([
+          stationsTable.toArray(),
+          tx.table<Instrument, string>('instruments').toArray(),
+          tx.table<Calibration, string>('calibrations').toArray(),
+        ]);
+        const { suspensions, unresolvedStationCodes } = backfillSuspensions({
+          stations,
+          instruments,
+          calibrations,
+          now: Date.now(),
+        });
+        if (suspensions.length > 0) {
+          await tx.table('suspensions').bulkPut(suspensions);
+        }
+        try {
+          localStorage.setItem(LS_KEYS.unresolvedSuspensions, JSON.stringify(unresolvedStationCodes));
+        } catch {
+          // 隐私模式忽略
         }
       });
   }
@@ -147,8 +205,18 @@ interface SeedStation {
   lng: number;
   elevM: number;
   bedrock: SeisStation['bedrock'];
+  /** 台网中心登记的运行状态（默认运行） */
+  runState?: SeisStation['runState'];
   siteNote: string;
   instruments: SeedInstrument[];
+  /** 台网中心登记的停测时段（施工停测→复测） */
+  suspensions?: Array<{
+    suspendDate: string;
+    resumeDate: string;
+    reason: string;
+    operator: string;
+    remark: string;
+  }>;
 }
 
 interface SeedArray {
@@ -187,6 +255,7 @@ export async function seedDemoData(): Promise<void> {
           lng: 103.5624,
           elevM: 1180,
           bedrock: '花岗岩',
+          runState: '运行',
           siteNote: '基岩出露，噪声本底低',
           instruments: [
             {
@@ -202,7 +271,7 @@ export async function seedDemoData(): Promise<void> {
                 {
                   id: 'cal_ltx01_bb_1',
                   instrumentId: 'ins_ltx01_bb',
-                  date: '2023-04-20',
+                  date: daysAgo(880),
                   sensitivity: 1502.4,
                   selfNoise: 1.82,
                   operator: '陈立群',
@@ -212,7 +281,7 @@ export async function seedDemoData(): Promise<void> {
                 {
                   id: 'cal_ltx01_bb_2',
                   instrumentId: 'ins_ltx01_bb',
-                  date: '2024-04-12',
+                  date: daysAgo(120),
                   sensitivity: 1468.9,
                   selfNoise: 1.95,
                   operator: '陈立群',
@@ -234,12 +303,12 @@ export async function seedDemoData(): Promise<void> {
                 {
                   id: 'cal_ltx01_st_1',
                   instrumentId: 'ins_ltx01_st',
-                  date: '2022-05-06',
+                  date: daysAgo(430),
                   sensitivity: 412.6,
                   selfNoise: 2.4,
                   operator: '周渝',
                   agency: '省地震局计量站',
-                  remark: '首次标定',
+                  remark: '首次标定，已逾标定周期',
                 },
               ],
             },
@@ -253,6 +322,7 @@ export async function seedDemoData(): Promise<void> {
           lng: 103.6412,
           elevM: 1425,
           bedrock: '玄武岩',
+          runState: '运行',
           siteNote: '半山台基，交通便利',
           instruments: [
             {
@@ -268,7 +338,7 @@ export async function seedDemoData(): Promise<void> {
                 {
                   id: 'cal_ltx02_bb_1',
                   instrumentId: 'ins_ltx02_bb',
-                  date: '2024-03-18',
+                  date: daysAgo(200),
                   sensitivity: 1204.8,
                   selfNoise: 1.42,
                   operator: '林之遥',
@@ -290,12 +360,12 @@ export async function seedDemoData(): Promise<void> {
                 {
                   id: 'cal_ltx02_st_1',
                   instrumentId: 'ins_ltx02_st',
-                  date: '2023-03-10',
+                  date: daysAgo(90),
                   sensitivity: 265.2,
                   selfNoise: 4.8,
                   operator: '周渝',
                   agency: '省地震局计量站',
-                  remark: '自噪超标，判定不合格',
+                  remark: '自噪超标，判定不合格，仪器已雷击停用',
                 },
               ],
             },
@@ -309,7 +379,18 @@ export async function seedDemoData(): Promise<void> {
           lng: 103.4987,
           elevM: 986,
           bedrock: '石灰岩',
-          siteNote: '河谷阶地，需注意汛期供电',
+          runState: '运行',
+          siteNote: '河谷阶地，需注意汛期供电；2024 年施工停测后已复测',
+          suspensions: [
+            {
+              // 施工停测 47 天，复测恢复；标定周期按停测天数顺延，扣减后今天仍未到期，不进更换提醒
+              suspendDate: daysAgo(200),
+              resumeDate: daysAgo(153),
+              reason: '台站施工改造临时停测',
+              operator: '台网中心',
+              remark: '复测后灵敏度合格，周期顺延 47 天',
+            },
+          ],
           instruments: [
             {
               id: 'ins_ltx03_bb',
@@ -319,17 +400,17 @@ export async function seedDemoData(): Promise<void> {
               serialNo: 'STS25-20230902-11',
               installDate: '2023-09-02',
               state: '在用',
-              remark: '新建站首台仪器',
+              remark: '新建站首台仪器，复测后恢复观测',
               calibrations: [
                 {
                   id: 'cal_ltx03_bb_1',
                   instrumentId: 'ins_ltx03_bb',
-                  date: '2024-09-05',
+                  date: daysAgo(340),
                   sensitivity: 2251.3,
                   selfNoise: 2.05,
                   operator: '林之遥',
                   agency: '省地震局计量站',
-                  remark: '脉冲响应合格',
+                  remark: '脉冲响应合格（复测后）',
                 },
               ],
             },
@@ -353,6 +434,7 @@ export async function seedDemoData(): Promise<void> {
           lng: 119.3421,
           elevM: 62,
           bedrock: '花岗岩',
+          runState: '运行',
           siteNote: '海岛台，防盐雾处理',
           instruments: [
             {
@@ -368,7 +450,7 @@ export async function seedDemoData(): Promise<void> {
                 {
                   id: 'cal_hx01_bb_1',
                   instrumentId: 'ins_hx01_bb',
-                  date: '2023-09-28',
+                  date: daysAgo(480),
                   sensitivity: 1498.2,
                   selfNoise: 2.25,
                   operator: '陈立群',
@@ -378,7 +460,7 @@ export async function seedDemoData(): Promise<void> {
                 {
                   id: 'cal_hx01_bb_2',
                   instrumentId: 'ins_hx01_bb',
-                  date: '2024-09-30',
+                  date: daysAgo(110),
                   sensitivity: 1483.6,
                   selfNoise: 2.42,
                   operator: '陈立群',
@@ -400,7 +482,7 @@ export async function seedDemoData(): Promise<void> {
                 {
                   id: 'cal_hx01_sm_1',
                   instrumentId: 'ins_hx01_sm',
-                  date: '2024-09-30',
+                  date: daysAgo(110),
                   sensitivity: 1.24,
                   selfNoise: 1.05,
                   operator: '周渝',
@@ -419,7 +501,8 @@ export async function seedDemoData(): Promise<void> {
           lng: 119.5112,
           elevM: 128,
           bedrock: '砂岩',
-          siteNote: '覆盖层较厚，需做场地响应校正',
+          runState: '停测',
+          siteNote: '覆盖层较厚，需做场地响应校正；施工停测中，停测时段中心尚未登记',
           instruments: [
             {
               id: 'ins_hx02_bb',
@@ -429,17 +512,17 @@ export async function seedDemoData(): Promise<void> {
               serialNo: 'CMG-3E-20190926-05',
               installDate: '2019-09-26',
               state: '待标定',
-              remark: '夜间自噪抬升，待复标',
+              remark: '夜间自噪抬升，台站施工停测待复测；停测时段未登记，计量侧挂起暂不计超期',
               calibrations: [
                 {
                   id: 'cal_hx02_bb_1',
                   instrumentId: 'ins_hx02_bb',
-                  date: '2023-06-11',
+                  date: daysAgo(400),
                   sensitivity: 1388.4,
                   selfNoise: 3.9,
                   operator: '林之遥',
                   agency: '国家测震台网计量中心',
-                  remark: '自噪接近上限，判定不合格',
+                  remark: '自噪接近上限，判定不合格；台站随后施工停测待复测',
                 },
               ],
             },
@@ -490,7 +573,15 @@ export async function seedDemoData(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [
+      db.arrays,
+      db.stations,
+      db.instruments,
+      db.calibrations,
+      db.replaces,
+      db.suspensions,
+      db.reconciliations,
+    ],
     async () => {
       const stamp = (offset: number): { createdAt: number; updatedAt: number } => ({
         createdAt: now + offset,
@@ -501,13 +592,26 @@ export async function seedDemoData(): Promise<void> {
       const stationRows: SeisStation[] = [];
       const instrumentRows: Instrument[] = [];
       const calibrationRows: Calibration[] = [];
+      const suspensionRows: Suspension[] = [];
 
       arrays.forEach((seed, arrayIndex) => {
         const { stations, ...arrayRest } = seed;
         arrayRows.push({ ...arrayRest, stationCount: stations.length, ...stamp(arrayIndex) });
         stations.forEach((stationSeed, stationIndex) => {
-          const { instruments, ...stationRest } = stationSeed;
-          stationRows.push({ ...stationRest, ...stamp(100 + arrayIndex * 100 + stationIndex) });
+          const { instruments, suspensions = [], runState = '运行', ...stationRest } = stationSeed;
+          stationRows.push({ ...stationRest, runState, ...stamp(100 + arrayIndex * 100 + stationIndex) });
+          suspensions.forEach((s, suspensionIndex) => {
+            suspensionRows.push({
+              id: `sus_${stationRest.id}_${suspensionIndex + 1}`,
+              stationCode: stationRest.code,
+              suspendDate: s.suspendDate,
+              resumeDate: s.resumeDate,
+              reason: s.reason,
+              operator: s.operator,
+              remark: s.remark,
+              ...stamp(150 + arrayIndex * 100 + stationIndex * 10 + suspensionIndex),
+            });
+          });
           instruments.forEach((instrumentSeed, instrumentIndex) => {
             const { calibrations, ...instrumentRest } = instrumentSeed;
             instrumentRows.push({
@@ -537,6 +641,7 @@ export async function seedDemoData(): Promise<void> {
       await db.instruments.bulkPut(instrumentRows);
       await db.calibrations.bulkPut(calibrationRows);
       await db.replaces.bulkPut(replaces);
+      await db.suspensions.bulkPut(suspensionRows);
     }
   );
 }
@@ -555,7 +660,15 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [
+      db.arrays,
+      db.stations,
+      db.instruments,
+      db.calibrations,
+      db.replaces,
+      db.suspensions,
+      db.reconciliations,
+    ],
     async () => {
       await Promise.all([
         db.arrays.clear(),
@@ -563,6 +676,8 @@ export async function clearAllTables(): Promise<void> {
         db.instruments.clear(),
         db.calibrations.clear(),
         db.replaces.clear(),
+        db.suspensions.clear(),
+        db.reconciliations.clear(),
       ]);
     }
   );
@@ -576,14 +691,17 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与几何页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
-    db.arrays.count(),
-    db.stations.count(),
-    db.instruments.count(),
-    db.calibrations.count(),
-    db.replaces.count(),
-  ]);
-  return { arrays, stations, instruments, calibrations, replaces };
+  const [arrays, stations, instruments, calibrations, replaces, suspensions, reconciliations] =
+    await Promise.all([
+      db.arrays.count(),
+      db.stations.count(),
+      db.instruments.count(),
+      db.calibrations.count(),
+      db.replaces.count(),
+      db.suspensions.count(),
+      db.reconciliations.count(),
+    ]);
+  return { arrays, stations, instruments, calibrations, replaces, suspensions, reconciliations };
 }
 
 /** 写入结构版本号到 localStorage，便于几何页比对 */
@@ -633,6 +751,27 @@ export function writeLastArrayId(id: string | null): void {
   try {
     if (id === null) localStorage.removeItem(LS_KEYS.lastArrayId);
     else localStorage.setItem(LS_KEYS.lastArrayId, id);
+  } catch {
+    // 忽略
+  }
+}
+
+/** v3 升级时补不出停测时段、单列待人工处理的台站码 */
+export function readUnresolvedSuspensionCodes(): string[] {
+  try {
+    const raw = localStorage.getItem(LS_KEYS.unresolvedSuspensions);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.map((item) => String(item)) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function writeUnresolvedSuspensionCodes(codes: string[]): void {
+  try {
+    if (codes.length === 0) localStorage.removeItem(LS_KEYS.unresolvedSuspensions);
+    else localStorage.setItem(LS_KEYS.unresolvedSuspensions, JSON.stringify(codes));
   } catch {
     // 忽略
   }

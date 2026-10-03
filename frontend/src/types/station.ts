@@ -1,14 +1,16 @@
 /** 基岩类型 */
+import type { StationRunState } from '@/types/suspension';
+
 export type BedrockType = '花岗岩' | '玄武岩' | '石灰岩' | '砂岩' | '片麻岩' | '第四系覆盖';
 
 export const BEDROCK_TYPES: BedrockType[] = ['花岗岩', '玄武岩', '石灰岩', '砂岩', '片麻岩', '第四系覆盖'];
 
-/** 台站：台阵内的观测点位 */
+/** 台站：台阵内的观测点位（台网中心侧档案） */
 export interface SeisStation {
   id: string;
   /** 所属台阵 */
   arrayId: string;
-  /** 台站码，如 SX01 */
+  /** 台站码，如 SX01（与计量站对账的唯一键） */
   code: string;
   /** 纬度（十进制度，-90 ~ 90） */
   lat: number;
@@ -18,6 +20,8 @@ export interface SeisStation {
   elevM: number;
   /** 基岩类型 */
   bedrock: BedrockType;
+  /** 运行状态（台网中心登记）：运行 / 停测；旧数据默认运行 */
+  runState: StationRunState;
   /** 场地备注 */
   siteNote: string;
   createdAt: number;

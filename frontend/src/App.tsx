@@ -10,6 +10,7 @@ import {
   DashboardOutlined,
   ExperimentOutlined,
   GlobalOutlined,
+  HomeOutlined,
   SwapOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons';
@@ -30,12 +31,14 @@ import {
   selectReplaces,
   startCalibrationSubscription,
 } from '@/stores/calibrationSlice';
+import { selectSuspensions, startCenterSubscription, runReconciliation } from '@/stores/centerSlice';
 import { DB_NAME, DB_VERSION, initDatabase } from '@/utils/db';
 
 const { Header, Sider, Content, Footer } = Layout;
 
 /** 按当前路径决定导航高亮项 */
 function buildSelectedKey(pathname: string, currentArrayId: string | null): string {
+  if (pathname.startsWith('/center')) return ROUTES.center;
   if (pathname.startsWith('/calibrations')) return ROUTES.calibrations;
   if (pathname.startsWith('/replacements')) return ROUTES.replacements;
   if (pathname.startsWith('/geometry')) return ROUTES.geometry;
@@ -54,6 +57,7 @@ export default function App() {
   const instruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const suspensions = useAppSelector(selectSuspensions);
   const currentArrayId = useAppSelector(selectCurrentArrayId);
   const ready = useAppSelector((state) => state.array.ready);
 
@@ -67,6 +71,9 @@ export default function App() {
         startArraySubscription(dispatch);
         startInstrumentSubscription(dispatch);
         startCalibrationSubscription(dispatch);
+        startCenterSubscription(dispatch);
+        // 首次进入按台站码自动对账；失败的由台网中心在中心页手动重试（计量认过结论不回退）
+        void dispatch(runReconciliation());
       } catch (error) {
         if (cancelled) return;
         messageApi.error(
@@ -116,7 +123,9 @@ export default function App() {
                 label: currentArray ? `台站仪器 · ${currentArray.name}` : '台站仪器（先选台阵）',
                 disabled: !currentArrayId,
               },
-              { key: ROUTES.calibrations, icon: <DashboardOutlined />, label: '标定记录台' },
+              { type: 'divider' as const },
+              { key: ROUTES.center, icon: <HomeOutlined />, label: '台网中心 · 停测与对账' },
+              { key: ROUTES.calibrations, icon: <DashboardOutlined />, label: '计量站 · 标定记录台' },
               { key: ROUTES.replacements, icon: <SwapOutlined />, label: '合格评定与更换' },
               { key: ROUTES.geometry, icon: <GlobalOutlined />, label: '台阵几何与备份' },
             ]}
@@ -125,6 +134,9 @@ export default function App() {
             <Space direction="vertical" size={2}>
               <span>
                 <AppstoreOutlined /> 台阵 {arrays.length} · 台站 {stations.length}
+              </span>
+              <span>
+                <HomeOutlined /> 停测时段 {suspensions.length}
               </span>
               <span>
                 <ExperimentOutlined /> 仪器 {instruments.length}

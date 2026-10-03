@@ -13,22 +13,36 @@ import {
 } from '@/utils/db';
 import type { ResponseVerdict } from '@/types/calibration';
 import { apertureKm, centroid, haversineKm, round, stationDistances } from '@/utils/geo';
+import { computeDue } from '@/utils/schedule';
+import type { Suspension } from '@/types/suspension';
+import type { Reconciliation } from '@/types/reconciliation';
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['arrays', 'stations', 'instruments', 'calibrations', 'replaces'] as const;
+export const BACKUP_KEYS = [
+  'arrays',
+  'stations',
+  'instruments',
+  'calibrations',
+  'replaces',
+  'suspensions',
+  'reconciliations',
+] as const;
 export type BackupKey = (typeof BACKUP_KEYS)[number];
 
 export type CountMap = Record<BackupKey, number>;
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
-    db.arrays.toArray(),
-    db.stations.toArray(),
-    db.instruments.toArray(),
-    db.calibrations.toArray(),
-    db.replaces.toArray(),
-  ]);
+  const [arrays, stations, instruments, calibrations, replaces, suspensions, reconciliations] =
+    await Promise.all([
+      db.arrays.toArray(),
+      db.stations.toArray(),
+      db.instruments.toArray(),
+      db.calibrations.toArray(),
+      db.replaces.toArray(),
+      db.suspensions.toArray(),
+      db.reconciliations.toArray(),
+    ]);
   return {
     app: 'gbseisarray',
     dbVersion: DB_VERSION,
@@ -38,6 +52,8 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     instruments,
     calibrations,
     replaces,
+    suspensions,
+    reconciliations,
   };
 }
 
@@ -68,6 +84,8 @@ export function validateBackup(input: unknown): {
     instruments: obj.instruments ?? [],
     calibrations: obj.calibrations ?? [],
     replaces: obj.replaces ?? [],
+    suspensions: obj.suspensions ?? [],
+    reconciliations: obj.reconciliations ?? [],
   };
   return { ok: true, errors, payload };
 }
@@ -80,6 +98,8 @@ export function countPayload(payload: BackupPayload): CountMap {
     instruments: payload.instruments.length,
     calibrations: payload.calibrations.length,
     replaces: payload.replaces.length,
+    suspensions: payload.suspensions.length,
+    reconciliations: payload.reconciliations.length,
   };
 }
 
@@ -117,13 +137,23 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables();
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [
+      db.arrays,
+      db.stations,
+      db.instruments,
+      db.calibrations,
+      db.replaces,
+      db.suspensions,
+      db.reconciliations,
+    ],
     async () => {
       await db.arrays.bulkPut(payload.arrays);
       await db.stations.bulkPut(payload.stations);
       await db.instruments.bulkPut(payload.instruments);
       await db.calibrations.bulkPut(payload.calibrations);
       await db.replaces.bulkPut(payload.replaces);
+      await db.suspensions.bulkPut(payload.suspensions);
+      await db.reconciliations.bulkPut(payload.reconciliations);
     }
   );
   return countPayload(payload);
@@ -134,6 +164,8 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   const arrayMap = new Map<string, string>();
   const stationMap = new Map<string, string>();
   const instrumentMap = new Map<string, string>();
+  /** 旧台站码 → 新台站码（停测时段与对账台账按台站码跟随） */
+  const stationCodeMap = new Map<string, string>();
 
   const arrays = payload.arrays.map((row) => {
     const id = createId('arr');
@@ -143,7 +175,13 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   const stations = payload.stations.map((row) => {
     const id = createId('stn');
     stationMap.set(row.id, id);
-    return { ...row, id, arrayId: arrayMap.get(row.arrayId) ?? row.arrayId };
+    // 同码可能冲突，追加导入给台站码加后缀以保证仍可按码对账
+    let nextCode = row.code;
+    if (payload.stations.some((other) => other !== row && other.code === row.code)) {
+      nextCode = `${row.code}-${id.slice(-4)}`.toUpperCase();
+    }
+    stationCodeMap.set(row.code, nextCode);
+    return { ...row, id, arrayId: arrayMap.get(row.arrayId) ?? row.arrayId, code: nextCode };
   });
   const instruments = payload.instruments.map((row) => {
     const id = createId('ins');
@@ -160,7 +198,26 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('rpl'),
     instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
   }));
-  return { ...payload, arrays, stations, instruments, calibrations, replaces };
+  const suspensions = payload.suspensions.map((row) => ({
+    ...row,
+    id: createId('sus'),
+    stationCode: stationCodeMap.get(row.stationCode) ?? row.stationCode,
+  }));
+  const reconciliations = payload.reconciliations.map((row) => ({
+    ...row,
+    id: createId('rec'),
+    stationCode: stationCodeMap.get(row.stationCode) ?? row.stationCode,
+  }));
+  return {
+    ...payload,
+    arrays,
+    stations,
+    instruments,
+    calibrations,
+    replaces,
+    suspensions,
+    reconciliations,
+  };
 }
 
 /** 按台阵汇总的几何与标定结论 */
@@ -193,7 +250,6 @@ export interface ArrayGeometrySummary {
 
 /** 由快照计算台阵几何与标定结论（供 /geometry 页展示） */
 export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummary[] {
-  const today = Date.now();
   return payload.arrays.map((array) => {
     const stations = payload.stations.filter((station) => station.arrayId === array.id);
     const stationIds = new Set(stations.map((station) => station.id));
@@ -223,13 +279,20 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
       (calibration) => calibration.responseVerdict === '不合格'
     ).length;
     const overdueCount = instruments.filter((instrument) => {
+      const station = stations.find((item) => item.id === instrument.stationId);
       const rows = calibrations
         .filter((calibration) => calibration.instrumentId === instrument.id)
         .sort((a, b) => b.date.localeCompare(a.date));
-      const lastDate = rows.length > 0 ? rows[0].date : instrument.installDate;
-      const lastTime = Date.parse(`${lastDate}T00:00:00`);
-      if (!Number.isFinite(lastTime)) return true;
-      return today - lastTime > 365 * 86400000;
+      const baseDate = rows.length > 0 ? rows[0].date : instrument.installDate;
+      const stationSuspensions = station
+        ? payload.suspensions.filter((s) => s.stationCode === station.code)
+        : [];
+      const result = computeDue({
+        baseDate,
+        stationSuspended: station?.runState === '停测',
+        suspensions: stationSuspensions,
+      });
+      return result.remind;
     }).length;
     const pendingReplaceCount = replaces.filter((replace) => replace.state !== '已复核').length;
 

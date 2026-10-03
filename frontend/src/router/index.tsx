@@ -12,6 +12,7 @@ const StationInstruments = lazy(() => import('@/pages/StationInstruments'));
 const CalibrationBoard = lazy(() => import('@/pages/CalibrationBoard'));
 const ReplaceBoard = lazy(() => import('@/pages/ReplaceBoard'));
 const GeometryView = lazy(() => import('@/pages/GeometryView'));
+const CenterBoard = lazy(() => import('@/pages/CenterBoard'));
 
 /** 懒加载页面占位 */
 function RouteFallback() {
@@ -32,6 +33,7 @@ function withSuspense(node: ReactNode): ReactNode {
 export const ROUTES = {
   arrays: '/arrays',
   stations: (arrayId: string): string => `/stations/${arrayId}/instruments`,
+  center: '/center',
   calibrations: '/calibrations',
   replacements: '/replacements',
   geometry: '/geometry',
@@ -45,6 +47,7 @@ export const appRoutes: RouteObject[] = [
       { index: true, element: <Navigate to={ROUTES.arrays} replace /> },
       { path: 'arrays', element: withSuspense(<ArrayList />) },
       { path: 'stations/:id/instruments', element: withSuspense(<StationInstruments />) },
+      { path: 'center', element: withSuspense(<CenterBoard />) },
       { path: 'calibrations', element: withSuspense(<CalibrationBoard />) },
       { path: 'replacements', element: withSuspense(<ReplaceBoard />) },
       { path: 'geometry', element: withSuspense(<GeometryView />) },

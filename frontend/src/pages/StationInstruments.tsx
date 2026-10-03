@@ -59,17 +59,19 @@ import {
   updateInstrument,
 } from '@/stores/instrumentSlice';
 import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
+import { selectSuspensionsByCode } from '@/stores/centerSlice';
 import { BEDROCK_TYPES, validateLatLng, type BedrockType, type SeisStation } from '@/types/station';
 import {
   COMMON_MODELS,
   INSTRUMENT_STATES,
   INSTRUMENT_TYPES,
   createEmptyInstrumentDraft,
-  daysUntilDue,
   type Instrument,
   type InstrumentState,
   type InstrumentType,
 } from '@/types/instrument';
+import { STATION_RUN_STATES, type StationRunState } from '@/types/suspension';
+import { computeDue } from '@/utils/schedule';
 import { formatLatLng, round } from '@/utils/geo';
 import { initDatabase } from '@/utils/db';
 
@@ -79,6 +81,7 @@ interface StationFormValues {
   lng: number;
   elevM: number;
   bedrock: BedrockType;
+  runState: StationRunState;
   siteNote: string;
 }
 
@@ -91,13 +94,14 @@ interface InstrumentFormValues {
   remark: string;
 }
 
-/** 台站行统计：仪器数、标定数、不合格数与超期台数 */
+/** 台站行统计：仪器数、标定数、不合格数与超期台数（停测挂起单列） */
 interface StationRow {
   station: SeisStation;
   instruments: Instrument[];
   calibrationCount: number;
   unqualified: number;
   overdue: number;
+  held: number;
   worstVerdict: string;
 }
 
@@ -115,6 +119,7 @@ export default function StationInstruments() {
   const allInstruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const suspensionsByCode = useAppSelector(selectSuspensionsByCode);
 
   const [stationModalOpen, setStationModalOpen] = useState(false);
   const [editingStationId, setEditingStationId] = useState<string | null>(null);
@@ -164,23 +169,33 @@ export default function StationInstruments() {
           const unqualified = stationCalibrations.filter(
             (calibration) => calibration.responseVerdict === '不合格'
           ).length;
-          const overdue = stationInstruments.filter((instrument) => {
+          const stationSuspensions = suspensionsByCode[station.code] ?? [];
+          let overdue = 0;
+          let held = 0;
+          stationInstruments.forEach((instrument) => {
             const own = calibrations
               .filter((calibration) => calibration.instrumentId === instrument.id)
               .sort((a, b) => b.date.localeCompare(a.date));
-            const last = own.length > 0 ? own[0].date : instrument.installDate;
-            return daysUntilDue(last, instrument.installDate) < 0;
-          }).length;
+            const baseDate = own.length > 0 ? own[0].date : instrument.installDate;
+            const result = computeDue({
+              baseDate,
+              stationSuspended: station.runState === '停测',
+              suspensions: stationSuspensions,
+            });
+            if (result.status === 'held') held += 1;
+            if (result.remind) overdue += 1;
+          });
           return {
             station,
             instruments: stationInstruments,
             calibrationCount: stationCalibrations.length,
             unqualified,
             overdue,
+            held,
             worstVerdict: unqualified > 0 ? '不合格' : stationCalibrations.length > 0 ? '合格' : '待判定',
           };
         }),
-    [allInstruments, calibrations, stationFilter, stations]
+    [allInstruments, calibrations, stationFilter, stations, suspensionsByCode]
   );
 
   const totals = useMemo(
@@ -190,6 +205,7 @@ export default function StationInstruments() {
       calibrations: rows.reduce((sum, row) => sum + row.calibrationCount, 0),
       unqualified: rows.reduce((sum, row) => sum + row.unqualified, 0),
       overdue: rows.reduce((sum, row) => sum + row.overdue, 0),
+      held: rows.reduce((sum, row) => sum + row.held, 0),
     }),
     [rows]
   );
@@ -208,6 +224,7 @@ export default function StationInstruments() {
       lng: 103.5,
       elevM: 1000,
       bedrock: '花岗岩',
+      runState: '运行',
       siteNote: '',
     });
     setStationModalOpen(true);
@@ -221,6 +238,7 @@ export default function StationInstruments() {
       lng: station.lng,
       elevM: station.elevM,
       bedrock: station.bedrock,
+      runState: station.runState ?? '运行',
       siteNote: station.siteNote,
     });
     setStationModalOpen(true);
@@ -249,6 +267,7 @@ export default function StationInstruments() {
         lng: Number(values.lng),
         elevM: Number(values.elevM),
         bedrock: values.bedrock,
+        runState: values.runState,
         siteNote: values.siteNote?.trim() ?? '',
       };
       if (editingStationId) {
@@ -318,12 +337,7 @@ export default function StationInstruments() {
       } else {
         await dispatch(createInstrument(payload)).unwrap();
         dispatch(patchDraft(payload));
-        const dueInDays = daysUntilDue(null, payload.installDate);
-        message.success(
-          dueInDays >= 0
-            ? `仪器已登记，距下次标定 ${dueInDays} 天`
-            : `仪器已登记，安装日期距今已超过标定周期 ${Math.abs(dueInDays)} 天，请尽快安排标定`
-        );
+        message.success('仪器已登记，已生成下一次标定待办；若台站停测，停测天数将从周期中扣除');
       }
       setInstrumentModalOpen(false);
     } catch (error) {
@@ -383,8 +397,8 @@ export default function StationInstruments() {
             {array.name} · 台站仪器登记
           </Typography.Title>
           <p className="gb-hint">
-            维护台站地理坐标与基岩类型并登记仪器；序列号全局唯一，登记后自动生成下一次标定待办（周期
-            365 天）。
+            维护台站地理坐标、基岩类型与运行状态并登记仪器；序列号全局唯一，登记后自动生成下一次标定待办（周期
+            365 天，台站停测天数由计量侧从周期中扣除）。停测起止请到「台网中心」页登记。
           </p>
         </div>
         <Space wrap>
@@ -420,6 +434,12 @@ export default function StationInstruments() {
           value={totals.overdue}
           suffix="台"
           tone={totals.overdue > 0 ? 'warning' : 'success'}
+        />
+        <StatBadge
+          label="停测挂起"
+          value={totals.held}
+          suffix="台"
+          tone={totals.held > 0 ? 'warning' : 'success'}
         />
       </div>
 
@@ -469,7 +489,18 @@ export default function StationInstruments() {
             {
               title: '台站码',
               width: 110,
-              render: (_: unknown, row: StationRow) => <span className="gb-mono">{row.station.code}</span>,
+              render: (_: unknown, row: StationRow) => (
+                <div>
+                  <span className="gb-mono">{row.station.code}</span>
+                  {row.station.runState === '停测' ? (
+                    <div>
+                      <Tag color="orange" style={{ marginInlineStart: 0 }}>
+                        停测
+                      </Tag>
+                    </div>
+                  ) : null}
+                </div>
+              ),
             },
             {
               title: '经纬度',
@@ -517,9 +548,12 @@ export default function StationInstruments() {
             },
             {
               title: '标定提醒',
-              width: 130,
-              render: (_: unknown, row: StationRow) =>
-                row.overdue > 0 ? <Tag color="red">超期 {row.overdue} 台</Tag> : <Tag color="green">按期</Tag>,
+              width: 150,
+              render: (_: unknown, row: StationRow) => {
+                if (row.overdue > 0) return <Tag color="red">超期 {row.overdue} 台</Tag>;
+                if (row.held > 0) return <Tag color="orange">停测挂起 {row.held} 台</Tag>;
+                return <Tag color="green">按期</Tag>;
+              },
             },
             {
               title: '综合结论',
@@ -637,17 +671,30 @@ export default function StationInstruments() {
                 },
                 {
                   title: '距下次标定',
-                  width: 130,
+                  width: 150,
                   render: (_: unknown, instrument: Instrument) => {
                     const own = calibrations
                       .filter((row) => row.instrumentId === instrument.id)
                       .sort((a, b) => b.date.localeCompare(a.date));
-                    const last = own.length > 0 ? own[0].date : instrument.installDate;
-                    const days = daysUntilDue(last, instrument.installDate);
+                    const station = stations.find((item) => item.id === instrument.stationId);
+                    const result = computeDue({
+                      baseDate: own.length > 0 ? own[0].date : instrument.installDate,
+                      stationSuspended: station?.runState === '停测',
+                      suspensions: station ? suspensionsByCode[station.code] ?? [] : [],
+                    });
+                    if (result.status === 'held') {
+                      return <Tag color="orange">停测挂起</Tag>;
+                    }
+                    const days = result.dueInDays ?? 0;
                     return (
-                      <span className={days < 0 ? 'gb-danger gb-mono' : 'gb-mono'}>
-                        {days < 0 ? `超期 ${Math.abs(days)} 天` : `剩余 ${days} 天`}
-                      </span>
+                      <div>
+                        <span className={days < 0 ? 'gb-danger gb-mono' : 'gb-mono'}>
+                          {days < 0 ? `超期 ${Math.abs(days)} 天` : `剩余 ${days} 天`}
+                        </span>
+                        {result.suspendedDays > 0 ? (
+                          <div className="gb-hint">扣停测 {result.suspendedDays} 天</div>
+                        ) : null}
+                      </div>
                     );
                   },
                 },
@@ -734,6 +781,14 @@ export default function StationInstruments() {
               </Form.Item>
             </Col>
           </Row>
+          <Form.Item name="runState" label="运行状态（台网中心登记）" rules={[{ required: true }]}>
+            <Select
+              options={STATION_RUN_STATES.map((state) => ({
+                label: state === '停测' ? '停测（施工停测，需在台网中心页登记停测起止）' : '运行',
+                value: state,
+              }))}
+            />
+          </Form.Item>
           <Form.Item name="siteNote" label="场地备注">
             <Input.TextArea rows={2} maxLength={80} placeholder="如：基岩出露，噪声本底低" />
           </Form.Item>

@@ -52,7 +52,8 @@ import {
   type Replace,
   type ReplaceState,
 } from '@/types/replace';
-import { daysUntilDue, type Instrument } from '@/types/instrument';
+import type { Instrument } from '@/types/instrument';
+import { dueStatusText } from '@/utils/schedule';
 import { useCalibHistory } from '@/hooks/useCalibHistory';
 import { initDatabase } from '@/utils/db';
 
@@ -73,7 +74,12 @@ interface AssessmentRow {
   arrayId: string;
   arrayName: string;
   lastDate: string;
-  dueInDays: number;
+  /** 扣减停测后的到期天数；挂起为 null */
+  dueInDays: number | null;
+  /** 是否停测挂起（中心未登记停测时段） */
+  held: boolean;
+  /** 扣掉的停测天数 */
+  suspendedDays: number;
   overdue: boolean;
   lastVerdict: string;
   calibrationCount: number;
@@ -102,32 +108,27 @@ export default function ReplaceBoard() {
     if (arrays.length === 0) void initDatabase();
   }, [arrays.length]);
 
-  /** 仪器评定行：结合标定结论与更换记录 */
+  /** 仪器评定行：结合标定结论与更换记录（到期天数已扣减停测，挂起仪器不算超期） */
   const rows = useMemo<AssessmentRow[]>(() => {
-    return instruments
-      .map((instrument) => {
-        const station = stations.find((row) => row.id === instrument.stationId);
-        const array = station ? arrays.find((row) => row.id === station.arrayId) : undefined;
-        const own = calibrations
-          .filter((row) => row.instrumentId === instrument.id)
-          .sort((a, b) => b.date.localeCompare(a.date));
-        const latest = own[0];
-        const lastDate = latest ? latest.date : instrument.installDate;
-        const dueInDays = daysUntilDue(lastDate, instrument.installDate);
+    return histories
+      .map((history) => {
+        const instrument = history.instrument;
         const replace =
           replaces
             .filter((row) => row.instrumentId === instrument.id)
             .sort((a, b) => b.date.localeCompare(a.date))[0] ?? null;
         return {
           instrument,
-          stationCode: station?.code ?? '未知台站',
-          arrayId: array?.id ?? '',
-          arrayName: array?.name ?? '未知台阵',
-          lastDate,
-          dueInDays,
-          overdue: dueInDays < 0,
-          lastVerdict: latest ? latest.responseVerdict : '待判定',
-          calibrationCount: own.length,
+          stationCode: history.stationCode,
+          arrayId: history.arrayId,
+          arrayName: history.arrayName,
+          lastDate: history.latest ? history.latest.date : instrument.installDate,
+          dueInDays: history.dueInDays,
+          held: history.held,
+          suspendedDays: history.due.suspendedDays,
+          overdue: history.overdue,
+          lastVerdict: history.latest ? history.latest.responseVerdict : '待判定',
+          calibrationCount: history.count,
           replace,
         };
       })
@@ -144,17 +145,19 @@ export default function ReplaceBoard() {
         }
         return true;
       })
-      .sort((a, b) => a.dueInDays - b.dueInDays);
-  }, [arrays, calibrations, filter, instruments, replaces, stations]);
+      .sort((a, b) => (a.dueInDays ?? Number.MAX_SAFE_INTEGER) - (b.dueInDays ?? Number.MAX_SAFE_INTEGER));
+  }, [histories, filter, replaces]);
 
   const totals = useMemo(() => {
     const overdue = rows.filter((row) => row.overdue).length;
+    const held = rows.filter((row) => row.held).length;
     const unqualified = rows.filter((row) => row.lastVerdict === '不合格').length;
     const pendingReplace = replaces.filter((row) => row.state === '待更换').length;
     const closedReplace = replaces.filter((row) => row.state === '已复核').length;
+    // 按期标定率只统计真正超期，停测挂起的仪器不计入分母之外的超期
     const cycleRate =
       rows.length === 0 ? 0 : Number((((rows.length - overdue) / rows.length) * 100).toFixed(1));
-    return { instruments: rows.length, overdue, unqualified, pendingReplace, closedReplace, cycleRate };
+    return { instruments: rows.length, overdue, held, unqualified, pendingReplace, closedReplace, cycleRate };
   }, [replaces, rows]);
 
   const replaceRows = useMemo(
@@ -254,8 +257,10 @@ export default function ReplaceBoard() {
     );
   };
 
-  /** 超期仪器提醒（标定周期 365 天） */
+  /** 超期仪器提醒（停测天数已扣减；挂起仪器不在内） */
   const overdueHistories = histories.filter((history) => history.overdue);
+  /** 停测挂起：中心未登记停测时段，暂不算超期 */
+  const heldHistories = histories.filter((history) => history.held);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
@@ -267,7 +272,8 @@ export default function ReplaceBoard() {
             合格评定与更换提醒
           </Typography.Title>
           <p className="gb-hint">
-            按标定周期（365 天）与脉冲响应结论评定仪器是否合格；超期未标定与不合格仪器高亮提示，可直接登记更换并跟踪到复核闭环。
+            计量站按 365 天标定周期与脉冲响应结论评定；台站经中心登记的停测天数从周期中扣除，复测后照常排标定；
+            停测期间够不到期、以及中心未登记停测时段的停测台站均先挂起，不计超期、不进更换提醒。
           </p>
         </div>
         <Button type="primary" icon={<PlusOutlined />} onClick={() => openCreate()}>
@@ -290,6 +296,12 @@ export default function ReplaceBoard() {
           tone={totals.unqualified > 0 ? 'warning' : 'success'}
         />
         <StatBadge label="按期标定率" value={totals.cycleRate} percent={totals.cycleRate} tone="success" />
+        <StatBadge
+          label="停测挂起"
+          value={totals.held}
+          suffix="台"
+          tone={totals.held > 0 ? 'warning' : 'success'}
+        />
         <StatBadge label="待更换" value={totals.pendingReplace} suffix="条" tone="warning" />
         <StatBadge label="已复核" value={totals.closedReplace} suffix="条" tone="info" />
       </div>
@@ -299,17 +311,27 @@ export default function ReplaceBoard() {
           type="warning"
           showIcon
           icon={<WarningFilled />}
-          message={`存在 ${overdueHistories.length} 台超期未标定仪器，请优先安排标定或登记更换`}
+          message={`存在 ${overdueHistories.length} 台超期未标定仪器（停测天数已扣除），请优先安排标定或登记更换`}
           description={overdueHistories
             .slice(0, 5)
             .map(
               (history) =>
-                `${history.arrayName} / ${history.stationCode} · ${history.instrument.model}（${history.instrument.serialNo}）已超期 ${Math.abs(history.dueInDays)} 天`
+                `${history.arrayName} / ${history.stationCode} · ${history.instrument.model}（${history.instrument.serialNo}）已超期 ${Math.abs(history.dueInDays ?? 0)} 天`
             )
             .join('；')}
         />
+      ) : heldHistories.length > 0 ? (
+        <Alert
+          type="info"
+          showIcon
+          message={`${heldHistories.length} 台仪器因台站停测挂起：等待台网中心登记停测时段，暂不计算超期`}
+          description={heldHistories
+            .slice(0, 5)
+            .map((history) => `${history.arrayName} / ${history.stationCode} · ${history.instrument.model}`)
+            .join('；')}
+        />
       ) : (
-        <Alert type="success" showIcon message="全部仪器均在标定周期内，无需特别提醒" />
+        <Alert type="success" showIcon message="全部在用仪器均在标定周期内（已扣除停测天数），无需特别提醒" />
       )}
 
       <FilterBar
@@ -346,7 +368,9 @@ export default function ReplaceBoard() {
           className="gb-table-compact"
           dataSource={rows}
           pagination={{ pageSize: 10, showSizeChanger: false }}
-          rowClassName={(row) => (row.overdue || row.lastVerdict === '不合格' ? 'gb-row-danger' : '')}
+          rowClassName={(row) =>
+            row.overdue || row.lastVerdict === '不合格' ? 'gb-row-danger' : row.held ? 'gb-row-warning' : ''
+          }
           columns={[
             {
               title: '仪器',
@@ -382,12 +406,29 @@ export default function ReplaceBoard() {
             },
             {
               title: '标定提醒',
-              width: 160,
-              render: (_: unknown, row: AssessmentRow) => (
-                <span className={row.overdue ? 'gb-danger gb-mono' : 'gb-mono'}>
-                  {row.overdue ? `超期 ${Math.abs(row.dueInDays)} 天` : `剩余 ${row.dueInDays} 天`}
-                </span>
-              ),
+              width: 175,
+              render: (_: unknown, row: AssessmentRow) => {
+                if (row.held) {
+                  return (
+                    <div>
+                      <Tag color="orange">停测挂起</Tag>
+                      <div className="gb-hint">待中心登记停测时段</div>
+                    </div>
+                  );
+                }
+                const text = dueStatusText({
+                  status: row.overdue ? 'overdue' : row.dueInDays === 0 ? 'due' : 'remaining',
+                  dueInDays: row.dueInDays,
+                } as never);
+                return (
+                  <div>
+                    <span className={row.overdue ? 'gb-danger gb-mono' : 'gb-mono'}>{text}</span>
+                    {row.suspendedDays > 0 ? (
+                      <div className="gb-hint">已扣停测 {row.suspendedDays} 天</div>
+                    ) : null}
+                  </div>
+                );
+              },
             },
             {
               title: '标定结论',
